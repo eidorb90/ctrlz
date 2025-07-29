@@ -24,7 +24,7 @@ def main():
         with open(f'.git/objects/{hash[:2]}/{hash[2:]}', 'rb') as f:
             content = f.read()
             content = zlib.decompress(content).decode('utf-8')
-            print(f" {content[8:]}", end="")
+            print(f" {content[7:]}", end="")
 
 
     else:
