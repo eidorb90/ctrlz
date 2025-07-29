@@ -23,9 +23,9 @@ def main():
             sys.exit(1)
         with open(f'.git/objects/{hash[:2]}/{hash[2:]}', 'rb') as f:
             content = f.read()
-            content = zlib.decompress(content).decode('utf-8')
-
-            print(f" {content}", end="")
+            decompressed = zlib.decompress(content)
+            _, obj_content = decompressed.split(b'\x00', 1)
+            print(obj_content.decode('utf-8'), end="")
 
 
     else:
