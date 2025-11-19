@@ -4,7 +4,7 @@ import zlib
 import hashlib
 import datetime 
 from colorama import init, Fore, Style
-
+import requests
 
 def main():
     init(autoreset=True)  # Initialize colorama
@@ -123,15 +123,21 @@ def main():
 
     elif command == "checkout":
         try:
-            hash = sys.argv[2]  # <-- fix index
+            hash = sys.argv[2] 
             checkout(hash)
         except Exception as e:
             print(Fore.RED + Style.BRIGHT + f"Error during checkout: {e}", file=sys.stderr)
             sys.exit(1)
 
+    elif command == "push":
+        ...
+
     else:   
         print(Fore.RED + Style.BRIGHT + f"Unknown command #{command}", file=sys.stderr)
         raise RuntimeError(f"Unknown command #{command}")
+
+def getCurrentRef(branch):
+    ...
 
 def hash_object(file_path: str) -> str:
     with open(file_path, 'rb') as f:
@@ -180,7 +186,7 @@ def write_tree(dir_path=".", print_hash=True):
     entries = []
     for entry in sorted(os.listdir(dir_path)):
         if entry.startswith(".ctrlz"):
-            continue  # skip .ctrlz directory
+            continue  
         entry_path = os.path.join(dir_path, entry)
         if os.path.isdir(entry_path):
             mode = b"40000"
@@ -310,195 +316,6 @@ def ls_commit():
                         except Exception:
                             commits.append((commit_hash, data, None))
 
-        # Sort: first by timestamp (ascending), then those without timestamp at the end
-        commits.sort(key=lambda x: (x[2] is None, x[2] if x[2] is not None else 0))
-        for commit_hash, data, _ in commits:
-            print(Fore.MAGENTA + Style.BRIGHT + f"\nCommit: {commit_hash}")
-            print(Fore.CYAN + Style.BRIGHT + "-" * 40)
-            for line in data.decode('utf-8').strip().split('\n'):
-                print(Fore.CYAN + "  " + line)
-            print(Fore.CYAN + Style.BRIGHT + "-" * 40)
-    except Exception as e:
-        print(Fore.RED + Style.BRIGHT + f"Error during ls-commits: {e}", file=sys.stderr)
-        sys.exit(1)
-
-def add(file_name: str = None):
-    if file_name != '.':
-        if os.path.exists(file_name):
-            if os.path.isdir(file_name):
-                mode = "40000"
-                sha = write_tree(file_name, print_hash=False)
-                entry = f"{mode} {file_name} {sha}"
-            else:
-                mode = "100644"
-                sha = hash_object(file_name)
-                entry = f"{mode} {file_name} {sha}"
-
-            index_path = ".ctrlz/index"
-            with open(index_path, "a") as index_file:
-                index_file.write(entry + "\n")
-            print(Fore.GREEN + Style.BRIGHT + f"✔ Added {file_name} to staging area")
-    else:
-
-        working_dir = os.getcwd()
-        if not os.path.exists(".ctrlz"):
-            print(Fore.RED + Style.BRIGHT + "Not a git repository (or any of the parent directories): .ctrlz", file=sys.stderr)
-            sys.exit(1)
-
-        # Read current index if exists
-        index_path = ".ctrlz/index"
-        current_entries = set()
-        if os.path.exists(index_path):
-            with open(index_path, "r") as index_file:
-                for line in index_file:
-                    current_entries.add(line.strip())
-
-        try:
-            entries = []
-            for entry in sorted(os.listdir(working_dir)):
-                if entry.startswith(".ctrlz"):
-                    continue
-                if os.path.isdir(entry):
-                    mode = "40000"
-                    sha = write_tree(os.path.join(working_dir, entry), print_hash=False)
-                    entries.append(f"{mode} {entry} {sha}")
-                else:
-                    mode = "100644"
-                    sha = hash_object(os.path.join(working_dir, entry))
-                    entries.append(f"{mode} {entry} {sha}")
-
-            new_entries_set = set(entries)
-
-            if new_entries_set == current_entries:
-                print(Fore.GREEN + Style.BRIGHT + "✔ Index is up to date, nothing to add")
-                return
-
-            with open(index_path, "w") as index_file:
-                index_file.write("\n".join(entries) + "\n")
-
-            print(Fore.GREEN + Style.BRIGHT + "✔ Added changes to staging area")
-
-        except FileNotFoundError:
-            print(Fore.RED + Style.BRIGHT + "No such file or directory", file=sys.stderr)
-            sys.exit(1)
-
-def commit(message: str = None):
-    index_path = ".ctrlz/index"
-    if not os.path.exists(index_path):
-        print(Fore.RED + Style.BRIGHT + "No changes added to commit", file=sys.stderr)
-        sys.exit(1)
-
-    with open(index_path, "r") as index_file:
-        entries = index_file.readlines()
-
-    if not entries:
-        print(Fore.RED + Style.BRIGHT + "No changes added to commit", file=sys.stderr)
-        sys.exit(1)
-
-    tree_hash = write_tree(print_hash=False)
-    message = message or "blank commit message"
-    parent = None
-
-    commit_hash = commit_tree(tree_hash, message, parent)
-
-    if not os.path.exists(".ctrlz/refs/heads"):
-        os.makedirs(".ctrlz/refs/heads")
-    if not os.path.exists(".ctrlz/refs/heads/main"):
-        with open(".ctrlz/refs/heads/main", "w") as ref_file:
-            ref_file.write(commit_hash + "\n")
-            ref_file.close()    
-
-    with open(index_path, "w") as index_file:
-        index_file.write("") 
-
-    print(Fore.GREEN + Style.BRIGHT + f"\n✔ Committed as {commit_hash}\n" + Fore.YELLOW + "-" * 32)
-
-def status():
-    index_path = ".ctrlz/index"
-    head_path = ".ctrlz/refs/heads/main"
-
-    # Read the latest commit hash
-    with open(head_path, "r") as head_file:
-        commit_hash = head_file.read().strip()
-
-    # Read the commit object and extract the tree hash
-    commit_obj_path = f".ctrlz/objects/{commit_hash[:2]}/{commit_hash[2:]}"
-    with open(commit_obj_path, "rb") as commit_file:
-        data = zlib.decompress(commit_file.read())
-        _, content = data.split(b'\x00', 1)
-        lines = content.decode().split('\n')
-        tree_hash = None
-        for line in lines:
-            if line.startswith("tree "):
-                tree_hash = line.split()[1]
-                break
-
-    # Read the tree object
-    tree_obj_path = f".ctrlz/objects/{tree_hash[:2]}/{tree_hash[2:]}"
-    with open(tree_obj_path, "rb") as tree_file:
-        tree_data = zlib.decompress(tree_file.read())
-        _, tree_entries = tree_data.split(b'\x00', 1)
-
-
-    print(Fore.YELLOW + Style.BRIGHT + "\n=== Committed tree entries ===")
-    print(Fore.MAGENTA + Style.BRIGHT + f"\nCommit: {commit_hash}")
-    print(Fore.CYAN + Style.BRIGHT + "-" * 40)
-    offset = 0
-    while offset < len(tree_entries):
-        space_index = tree_entries.find(b' ', offset)
-        mode = tree_entries[offset:space_index].decode()
-        offset = space_index + 1
-        null_index = tree_entries.find(b'\x00', offset)
-        name = tree_entries[offset:null_index].decode()
-        offset = null_index + 1
-        sha_bytes = tree_entries[offset:offset+20]
-        sha = sha_bytes.hex()
-        offset += 20
-        print(Fore.BLUE + f"  {mode} {name} {sha}")
-
-    # Show staged changes
-    with open(index_path, "r") as index_file:
-        entries = index_file.readlines()
-
-    if not entries:
-        print(Fore.GREEN + Style.BRIGHT + "\n✔ Nothing to commit, working tree clean")
-    else:
-        print(Fore.YELLOW + Style.BRIGHT + "\n=== Changes to be committed ===")
-        for entry in entries:
-            print(Fore.BLUE + "  " + entry.strip())
-        print(Fore.YELLOW + "-" * 32)
-
-def ls_commit():
-    try:
-        objects_dir = ".ctrlz/objects"
-        print(Fore.YELLOW + Style.BRIGHT + "\n=== Commits ===")
-        commits = []
-        for subdir in os.listdir(objects_dir):
-            subdir_path = os.path.join(objects_dir, subdir)
-            if not os.path.isdir(subdir_path):
-                continue
-            for obj_file in os.listdir(subdir_path):
-                obj_path = os.path.join(subdir_path, obj_file)
-                with open(obj_path, 'rb') as f:
-                    data = zlib.decompress(f.read())
-                    if data.startswith(b'commit '):
-                        commit_hash = subdir + obj_file
-                        # Extract timestamp from commit object
-                        try:
-                            _, content = data.split(b'\x00', 1)
-                            lines = content.decode('utf-8', errors='replace').split('\n')
-                            # Find committer line
-                            timestamp = None
-                            for line in lines:
-                                if line.startswith("committer "):
-                                    parts = line.split()
-                                    # Try to get the second last part as timestamp (if present and isdigit)
-                                    if len(parts) >= 3 and parts[-2].isdigit():
-                                        timestamp = int(parts[-2])
-                                    break
-                            commits.append((commit_hash, data, timestamp))
-                        except Exception:
-                            commits.append((commit_hash, data, None))
         # Sort: first by timestamp (ascending), then those without timestamp at the end
         commits.sort(key=lambda x: (x[2] is None, x[2] if x[2] is not None else 0))
         for commit_hash, data, _ in commits:

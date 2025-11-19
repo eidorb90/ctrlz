@@ -6,6 +6,7 @@ setup(
     packages=find_packages(),  # Discover all packages, including 'app'
     install_requires=[
         "colorama",
+        "requests"
     ],
     entry_points={
         "console_scripts": [
