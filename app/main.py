@@ -5,9 +5,12 @@ import hashlib
 import datetime 
 from colorama import init, Fore, Style
 import requests
+import json
+import concurrent.futures
+import fnmatch
 
 def main():
-    init(autoreset=True)  # Initialize colorama
+    init(autoreset=True)  
     
     command = sys.argv[1]
     if command == "init":
@@ -101,7 +104,7 @@ def main():
     elif command == "commit":
         try:
             message = sys.argv[3]
-            commit(message=message)
+            commit_f(message=message)
 
         except Exception as e:
             print(Fore.RED + Style.BRIGHT + f"Error during commit: {e}", file=sys.stderr)
@@ -129,15 +132,182 @@ def main():
             print(Fore.RED + Style.BRIGHT + f"Error during checkout: {e}", file=sys.stderr)
             sys.exit(1)
 
+    elif command == "setRepoInfo":
+        username = sys.argv[2]
+        repoName = sys.argv[3]
+
+        file_dir = f".ctrlz/config.json"
+
+        payload = {"UserName": username, "RepoName": repoName}
+
+        with open(file_dir, "w") as file:
+            json.dump(payload, file)
+        
+        print("Successfully set repo info")
+
     elif command == "push":
-        ...
+        # 1. Load Config
+        file_dir = ".ctrlz/config.json"
+        if not os.path.exists(file_dir):
+            print(Fore.RED + "Please run 'ctrlz setRepoInfo <user> <repo>' first.")
+            sys.exit(1)
+            
+        with open(file_dir, 'r') as file:
+            data = json.load(file)
+        username = data["UserName"]
+        reponame = data["RepoName"]
+
+        # 2. Get Remote State
+        response = getCurrentRef("main", username, reponame)
+        if response.status_code == 200:
+            remote_hash = response.text.strip()
+        else:
+            remote_hash = None 
+
+        # 3. Get Local State
+        local_hash_location = ".ctrlz/refs/heads/main"
+        with open(local_hash_location, "r") as file:
+            local_hash = file.read().strip()
+
+        # 4. Find Missing Commits
+        commits_to_upload = []
+        curr = local_hash
+        
+        print(f"Local: {local_hash[:7]} | Remote: {remote_hash[:7] if remote_hash else 'None'}")
+        
+        while curr and curr != remote_hash:
+            commits_to_upload.append(curr)
+            _, parent = read_commit(curr)
+            curr = parent
+
+        # 5. Find ALL Objects (Trees & Blobs) for those commits
+        objects_to_upload = set(commits_to_upload) # Start with the commits themselves
+        
+        for commit in commits_to_upload:
+            tree_hash, _ = read_commit(commit)
+            if tree_hash:
+                # Add the tree itself
+                objects_to_upload.add(tree_hash)
+                # Find everything inside that tree
+                objects_to_upload.update(find_objects_in_tree(tree_hash))
+
+        print(Fore.YELLOW + f"Pushing {len(objects_to_upload)} objects...")
+
+        # 6. Upload Everything
+        # with concurrent.futures.ThreadPoolExecutor(max_workers=50) as executor:
+        #     futures = []
+        #     for obj_hash in objects_to_upload:
+        #         futures.append(executor.submit(upload_worker, obj_hash, username, reponame))
+
+        #     count = 0
+        #     total = len(objects_to_upload)
+        #     for future in concurrent.futures.as_completed(futures):
+        #         print(f"\rProgress: {count}/{total} objects uploaded...", end="")
+            
+        #     print("\n")
+
+        upload_batch(list(objects_to_upload), username, reponame)
+
+        # 7. Update Ref
+        requests.post(
+            f"https://ctrlz.brodie-rogers.com/update-ref/{username}/{reponame}",
+            json={"Ref": "main", "Hash": local_hash}
+        )
+        
+        print(Fore.GREEN + "Push complete!") 
+
+
 
     else:   
         print(Fore.RED + Style.BRIGHT + f"Unknown command #{command}", file=sys.stderr)
         raise RuntimeError(f"Unknown command #{command}")
 
-def getCurrentRef(branch):
-    ...
+def upload_batch(hashes, username, reponame):
+    batch_data = bytearray()
+    batch_size = 50 * 1024 * 1024
+
+    for obj_hash in hashes:
+        path = f".ctrlz/objects/{obj_hash[:2]}/{obj_hash[2:]}"
+        if not os.path.exists(path):
+            continue
+
+        with open(path, 'rb') as file:
+            compressed_data = file.read()
+            full_object_data = zlib.decompress(compressed_data)
+
+        if len(full_object_data) > 5 * 1024 * 1024: # If bigger than 10MB
+            print(f"Found large object: {obj_hash} ({len(full_object_data) / 1024 / 1024:.2f} MB)")
+
+        batch_data.extend(full_object_data)
+
+        if len(batch_data) >= batch_size:
+            print(f"Sending batch of {len(batch_data)} bytes...")
+            response = requests.post(
+                f"https://ctrlz.brodie-rogers.com/upload-batch/{username}/{reponame}",
+                data=batch_data
+            )
+
+            if response.status_code != 200:
+                print(Fore.RED + f"Batch upload failed: {response.status_code}")
+                print(response.text)
+                sys.exit(1)
+
+            batch_data = bytearray()
+        
+    if len(batch_data) > 0:
+        print(f"Sending batch of {len(batch_data)} bytes...")
+        response = requests.post(
+            f"https://ctrlz.brodie-rogers.com/upload-batch/{username}/{reponame}",
+            data=batch_data
+        )
+
+        if response.status_code != 200:
+            print(Fore.RED + f"Batch upload failed: {response.status_code}")
+            print(response.text)
+            sys.exit(1)
+
+
+def load_ignore_rules():
+    rules = []
+    if os.path.exists(".ctrlzignore"):
+        with open(".ctrlzignore", "r") as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    rules.append(line)
+    return rules
+
+def is_ignored(path, rules):
+    for rule in rules:
+        # Match against the full path or just the filename
+        if fnmatch.fnmatch(path, rule) or fnmatch.fnmatch(os.path.basename(path), rule):
+            return True
+    return False   
+
+def upload_worker(obj_hash, username, reponame):
+    path = f".ctrlz/objects/{obj_hash[:2]}/{obj_hash[2:]}"
+    if not os.path.exists(path):
+        return
+    
+    with open(path, 'rb') as f:
+        raw_compress = f.read()
+        full_data = zlib.decompress(raw_compress)
+
+    response = requests.post(
+        f"https://ctrlz.brodie-rogers.com/upload/{username}/{reponame}",
+        data=full_data
+    )
+
+    if response.status_code == 200:
+        return f"Uploaded {obj_hash[:7]}"
+    else:
+        return f"Failed {obj_hash[:7]}"
+
+def getCurrentRef(branch, username, reponame):
+
+    response = requests.get(f"https://ctrlz.brodie-rogers.com/refs/{username}/{reponame}/{branch}")
+
+    return response
 
 def hash_object(file_path: str) -> str:
     with open(file_path, 'rb') as f:
@@ -183,10 +353,17 @@ def ls_tree(tree_hash: str):
     print(Fore.YELLOW + "-" * 32)
 
 def write_tree(dir_path=".", print_hash=True):
+    ignore_rules = load_ignore_rules()
     entries = []
     for entry in sorted(os.listdir(dir_path)):
         if entry.startswith(".ctrlz"):
-            continue  
+            continue 
+        full_path = os.path.join(dir_path, entry)
+        relative_path = os.path.relpath(full_path, start=".")
+        
+        if is_ignored(relative_path, ignore_rules):
+            continue
+
         entry_path = os.path.join(dir_path, entry)
         if os.path.isdir(entry_path):
             mode = b"40000"
@@ -328,6 +505,7 @@ def ls_commit():
         print(Fore.RED + Style.BRIGHT + f"Error during ls-commits: {e}", file=sys.stderr)
         sys.exit(1)
 
+
 def add(file_name: str = None):
     if file_name != '.':
         if os.path.exists(file_name):
@@ -360,10 +538,18 @@ def add(file_name: str = None):
                     current_entries.add(line.strip())
 
         try:
+            # 1. Load ignore rules
+            ignore_rules = load_ignore_rules()
+            
             entries = []
             for entry in sorted(os.listdir(working_dir)):
                 if entry.startswith(".ctrlz"):
                     continue
+                
+                # 2. Check if the file/folder is ignored
+                if is_ignored(entry, ignore_rules):
+                    continue 
+
                 if os.path.isdir(entry):
                     mode = "40000"
                     sha = write_tree(os.path.join(working_dir, entry), print_hash=False)
@@ -388,8 +574,9 @@ def add(file_name: str = None):
             print(Fore.RED + Style.BRIGHT + "No such file or directory", file=sys.stderr)
             sys.exit(1)
 
-def commit(message: str = None):
+def commit_f(message: str = None):
     index_path = ".ctrlz/index"
+
     if not os.path.exists(index_path):
         print(Fore.RED + Style.BRIGHT + "No changes added to commit", file=sys.stderr)
         sys.exit(1)
@@ -416,6 +603,7 @@ def commit(message: str = None):
 
     with open(index_path, "w") as index_file:
         index_file.write("") 
+
 
     print(Fore.GREEN + Style.BRIGHT + f"\n✔ Committed as {commit_hash}\n" + Fore.YELLOW + "-" * 32)
 
@@ -488,6 +676,73 @@ def checkout(hash: str):
                             outf.write(file_content)
     restore_tree(tree_hash)
     print(Fore.GREEN + Style.BRIGHT + f"✔ Checked out commit {hash} and updated working directory")
+
+def read_commit(commit_hash):
+    # 1. Construct path to object
+    path = f".ctrlz/objects/{commit_hash[:2]}/{commit_hash[2:]}"
+    
+    if not os.path.exists(path):
+        return None, None
+
+    # 2. Read and decompress
+    with open(path, "rb") as f:
+        raw = zlib.decompress(f.read())
+        # Split header from content (commit <size>\0<content>)
+        _, content = raw.split(b'\x00', 1)
+        content = content.decode('utf-8')
+    
+    # 3. Extract Tree and Parent
+    tree_hash = None
+    parent_hash = None
+    
+    for line in content.split('\n'):
+        if line.startswith("tree "):
+            tree_hash = line.split()[1]
+        elif line.startswith("parent "):
+            parent_hash = line.split()[1]
+            
+    return tree_hash, parent_hash
+
+def find_objects_in_tree(tree_hash):
+    objects = set() # Use a set to avoid duplicates
+    
+    # 1. Read the tree object
+    path = f".ctrlz/objects/{tree_hash[:2]}/{tree_hash[2:]}"
+    if not os.path.exists(path):
+        return objects
+        
+    with open(path, "rb") as f:
+        obj_data = zlib.decompress(f.read())
+        # Split header "tree <size>\0" from content
+        _, content = obj_data.split(b'\x00', 1)
+        
+    # 2. Parse entries
+    offset = 0
+    while offset < len(content):
+        # Mode (e.g., 100644) ends at space
+        space_idx = content.find(b' ', offset)
+        mode = content[offset:space_idx]
+        offset = space_idx + 1
+        
+        # Name ends at null byte
+        null_idx = content.find(b'\x00', offset)
+        offset = null_idx + 1
+        
+        # Hash is the next 20 bytes
+        sha_bytes = content[offset:offset+20]
+        sha_hex = sha_bytes.hex()
+        offset += 20
+        
+        # Add this object to our collection
+        objects.add(sha_hex)
+        
+        # 3. If it's a directory (Tree), recurse!
+        # "40000" is the mode for directories in Git
+        if mode == b'40000':
+            sub_objects = find_objects_in_tree(sha_hex)
+            objects.update(sub_objects)
+            
+    return objects
 
 if __name__ == "__main__":
     print(Fore.YELLOW + "Python executable: " + Fore.WHITE + Style.BRIGHT + sys.executable, file=sys.stderr)
